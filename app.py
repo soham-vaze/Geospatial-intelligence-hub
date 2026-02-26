@@ -207,17 +207,6 @@ st.sidebar.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# -------- RESET BUTTON --------
-if st.sidebar.button("🔄  Reset Map View"):
-    st.session_state.map_center = [13.7367, 100.5231]
-    st.session_state.map_zoom = 6
-    st.session_state.selected_site = None
-    st.session_state.show_modal = False
-
-    # Force full map rebuild
-    st.session_state.map_key += 1
-
-    st.rerun()
 
 # -------- DETAIL MODAL --------
 @st.dialog("📍 Site Details")
@@ -282,11 +271,81 @@ class FlyToOnClick(MacroElement):
         super().render(**kwargs)
 
 
+# -------- RESET VIEW CONTROL --------
+class ResetViewControl(MacroElement):
+    """Injects a custom Leaflet control button on the map to reset to default view."""
+    def __init__(self, default_lat, default_lng, default_zoom=6, duration=1.5):
+        super().__init__()
+        self._name = "ResetViewControl"
+        self._template = Template("""
+            {% macro script(this, kwargs) %}
+            (function() {
+                var ResetControl = L.Control.extend({
+                    options: { position: 'topright' },
+                    onAdd: function(map) {
+                        var btn = L.DomUtil.create('button', '');
+                        btn.innerHTML = '&#x21BA;&nbsp; Reset View';
+                        btn.title = 'Reset map to Thailand overview';
+                        btn.style.cssText = [
+                            'background: linear-gradient(135deg,#1e293b,#0f172a)',
+                            'color: #60a5fa',
+                            'border: 1px solid #334155',
+                            'border-radius: 8px',
+                            'padding: 7px 14px',
+                            'font-size: 12px',
+                            'font-weight: 600',
+                            'font-family: Segoe UI, Arial, sans-serif',
+                            'cursor: pointer',
+                            'box-shadow: 0 2px 8px rgba(0,0,0,0.35)',
+                            'transition: all 0.2s',
+                            'margin: 10px 10px 0 0',
+                            'letter-spacing: 0.3px'
+                        ].join(';');
+                        btn.onmouseover = function() {
+                            btn.style.background = 'linear-gradient(135deg,#1e3a5f,#1e293b)';
+                            btn.style.color = '#93c5fd';
+                        };
+                        btn.onmouseout = function() {
+                            btn.style.background = 'linear-gradient(135deg,#1e293b,#0f172a)';
+                            btn.style.color = '#60a5fa';
+                        };
+                        L.DomEvent.on(btn, 'click', function(e) {
+                            L.DomEvent.stopPropagation(e);
+                            window._flyToTarget = null;
+                            {{ this.map_name }}.flyTo(
+                                [{{ this.lat }}, {{ this.lng }}],
+                                {{ this.zoom }},
+                                {animate: true, duration: {{ this.duration }}}
+                            );
+                        });
+                        return btn;
+                    }
+                });
+                new ResetControl().addTo({{ this.map_name }});
+            })();
+            {% endmacro %}
+        """)
+        self.lat = default_lat
+        self.lng = default_lng
+        self.zoom = default_zoom
+        self.duration = duration
+        self.map_name = None
+
+    def render(self, **kwargs):
+        figure = self.get_root()
+        self.map_name = list(figure._children.keys())[0] if figure else "map"
+        super().render(**kwargs)
+
 # -------- MAP --------
 m = folium.Map(
     location=st.session_state.map_center,
     zoom_start=st.session_state.map_zoom
 )
+
+# Add the reset button directly on the map
+reset_ctrl = ResetViewControl(13.7367, 100.5231, default_zoom=6, duration=1.5)
+reset_ctrl.map_name = m.get_name()
+m.add_child(reset_ctrl)
 
 for idx, (_, row) in enumerate(filtered_df.iterrows()):
     uid = f"site_{idx}"
