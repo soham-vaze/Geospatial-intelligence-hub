@@ -18,7 +18,7 @@ if "map_key" not in st.session_state:
 # -------- LOAD DATA --------
 @st.cache_data
 def load_data():
-    df = pd.read_excel("dummy_data.xlsx")
+    df = pd.read_excel("POC Ford Dummy Data.xlsx")
     df["Lat"] = pd.to_numeric(df["Lat"], errors="coerce")
     df["Long"] = pd.to_numeric(df["Long"], errors="coerce")
     df["Bays"] = pd.to_numeric(df["Bays"], errors="coerce").fillna(0)
@@ -122,7 +122,7 @@ class FlyToOnClick(MacroElement):
         super().render(**kwargs)
 
 # -------- MAP GENERATION --------
-m = folium.Map(location=st.session_state.map_center, zoom_start=st.session_state.map_zoom, tiles="cartodbpositron")
+m = folium.Map(location=[13.7367, 100.5231], zoom_start=6)
 m.add_child(ResetViewControl(13.7367, 100.5231, 6))
 
 for idx, (_, row) in enumerate(filtered_df.iterrows()):
