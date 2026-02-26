@@ -17,7 +17,7 @@ def load_data():
 
 df = load_data()
 
-# -------- LAYER CONFIG --------
+# -------- LAYER COLORS --------
 layer_colors = {
     "L1": "blue",
     "L2": "green",
@@ -62,29 +62,79 @@ filtered_df = df[
 ]
 
 # -------- MAP --------
-m = folium.Map(location=[13.7367, 100.5231], zoom_start=6)
+m = folium.Map(
+    location=[13.7367, 100.5231],
+    zoom_start=6,
+    tiles="CartoDB positron"
+)
 
 for _, row in filtered_df.iterrows():
+
+    popup_html = f"""
+    <div style="width:350px; font-family: Arial; font-size:13px;">
+        <h4 style="margin-bottom:8px;">{row.get('Name','N/A')}</h4>
+        
+        <b>Full Address:</b><br>
+        {row.get('Address','N/A')}<br>
+        <b>Geocode:</b> {row.get('Lat','N/A')}, {row.get('Long','N/A')}<br><br>
+        
+        <b>Category:</b> {row.get('Category','N/A')}<br>
+        <b>Sub-Category:</b> {row.get('SubCategory','N/A')}<br><br>
+        
+        <b>Contact Details:</b><br>
+        📞 {row.get('Phone','N/A')}<br>
+        📧 {row.get('Email','N/A')}<br>
+        👤 {row.get('Owner','N/A')}<br><br>
+        
+        <b>Operating Status:</b> {row.get('Status','Unknown')}<br>
+        <b>Source System:</b> {row.get('SourceSystem','N/A')}<br>
+        <b>Last Updated:</b> {row.get('LastUpdated','N/A')}
+        
+        <hr style="margin-top:10px;">
+        <i>Scroll below map for complete details</i>
+    </div>
+    """
+
     folium.Marker(
         location=[row["Lat"], row["Long"]],
-        popup=f"""
-        <b>{row['Name']}</b><br>
-        Layer: {row['Layer']}<br>
-        Bays: {row['Bays']}<br>
-        Status: {row.get('Status','N/A')}<br>
-        Address: {row.get('Address','N/A')}
-        """,
+        popup=folium.Popup(popup_html, max_width=400),
         icon=folium.Icon(
             color=layer_colors.get(row["Layer"], "blue"),
             icon="info-sign"
         )
     ).add_to(m)
 
-st_folium(m, width="stretch", height=600)
+map_data = st_folium(m, width="stretch", height=600)
+
+# -------- CAPTURE CLICK --------
+selected_location = None
+
+if map_data and map_data.get("last_object_clicked"):
+    clicked = map_data["last_object_clicked"]
+
+    lat = clicked.get("lat")
+    lng = clicked.get("lng")
+
+    # Match clicked location to dataframe
+    selected_location = filtered_df[
+        (filtered_df["Lat"].round(5) == round(lat, 5)) &
+        (filtered_df["Long"].round(5) == round(lng, 5))
+    ]
+
+# -------- VIEW MORE SECTION --------
+if selected_location is not None and not selected_location.empty:
+    loc = selected_location.iloc[0]
+
+    st.divider()
+    st.subheader(f"📍 {loc['Name']} - Detailed Information")
+
+    with st.expander("View More Details", expanded=True):
+        for col in df.columns:
+            st.write(f"**{col}:** {loc[col]}")
 
 # -------- METRICS --------
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 col1.metric("Active Sites", len(filtered_df))
 col2.metric("Total Bay Capacity", int(filtered_df["Bays"].sum()))
-col3.metric("L5 Opportunities",
-            len(filtered_df[filtered_df["Layer"] == "L5"]))
+# col3.metric("L5 Opportunities",
+#             len(filtered_df[filtered_df["Layer"] == "L5"]))
