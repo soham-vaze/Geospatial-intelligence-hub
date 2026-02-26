@@ -8,7 +8,7 @@ st.set_page_config(layout="wide", page_title="Ford Geospatial Hub", page_icon="ð
 @st.cache_data
 def load_data():
     # Loading the specific dataset from your folder
-    df = pd.read_excel("dummy_data.xlsx")
+    df = pd.read_excel("POC Ford Dummy Data.xlsx")
     df['Lat'] = pd.to_numeric(df['Lat'], errors='coerce')
     df['Long'] = pd.to_numeric(df['Long'], errors='coerce')
     df = df.dropna(subset=['Lat', 'Long'])
