@@ -18,7 +18,8 @@ if "map_key" not in st.session_state:
 # -------- LOAD DATA --------
 @st.cache_data
 def load_data():
-    df = pd.read_excel("POC Ford Dummy Data.xlsx")
+    # Note: Use pd.read_csv if your file is the csv provided, otherwise read_excel
+    df = pd.read_excel("dummy_data.xlsx")
     df["Lat"] = pd.to_numeric(df["Lat"], errors="coerce")
     df["Long"] = pd.to_numeric(df["Long"], errors="coerce")
     df["Bays"] = pd.to_numeric(df["Bays"], errors="coerce").fillna(0)
@@ -59,7 +60,41 @@ for layer, (_, hex_color, label) in layer_meta.items():
 min_bays = st.sidebar.slider("Min. Service Bays", 0, int(df["Bays"].max()), 0)
 filtered_df = df[(df["Layer"].isin(selected_layers)) & (df["Bays"] >= min_bays)]
 
-# -------- RESET VIEW BUTTON CLASS --------
+# -------- RESET VIEW BUTTON CLASS (FIXED) --------
+# class ResetViewControl(MacroElement):
+#     def __init__(self, lat, lng, zoom=6):
+#         super().__init__()
+#         self._template = Template("""
+#             {% macro script(this, kwargs) %}
+#             (function() {
+#                 var ResetControl = L.Control.extend({
+#                     options: { position: 'topright' },
+#                     onAdd: function(map) {
+#                         var btn = L.DomUtil.create('button', '');
+#                         btn.innerHTML = '↺ Reset Map';
+#                         btn.style.cssText = 'background:#1e293b; color:#60a5fa; border:1px solid #334155; border-radius:6px; padding:6px 12px; cursor:pointer; font-weight:bold; font-size:12px; margin:10px;';
+#                         L.DomEvent.on(btn, 'click', function(e) {
+#                             L.DomEvent.stopPropagation(e);
+#                             // FIX: Close any open popups before resetting view to prevent cut-off issues
+#                             map.closePopup();
+#                             map.flyTo([{{ this.lat }}, {{ this.lng }}], {{ this.zoom }}, {animate: true, duration: 1.5});
+#                         });
+#                         return btn;
+#                     }
+#                 });
+#                 new ResetControl().addTo({{ this.map_name }});
+#             })();
+#             {% endmacro %}
+#         """)
+#         self.lat, self.lng, self.zoom = lat, lng, zoom
+#         self.map_name = None
+
+#     def render(self, **kwargs):
+#         figure = self.get_root()
+#         self.map_name = list(figure._children.keys())[0] if figure else "map"
+#         super().render(**kwargs)
+
+# -------- RESET VIEW BUTTON CLASS (DYNAMIC VISIBILITY FIX) --------
 class ResetViewControl(MacroElement):
     def __init__(self, lat, lng, zoom=6):
         super().__init__()
@@ -72,9 +107,33 @@ class ResetViewControl(MacroElement):
                         var btn = L.DomUtil.create('button', '');
                         btn.innerHTML = '↺ Reset Map';
                         btn.style.cssText = 'background:#1e293b; color:#60a5fa; border:1px solid #334155; border-radius:6px; padding:6px 12px; cursor:pointer; font-weight:bold; font-size:12px; margin:10px;';
+                        
                         L.DomEvent.on(btn, 'click', function(e) {
                             L.DomEvent.stopPropagation(e);
-                            map.flyTo([{{ this.lat }}, {{ this.lng }}], {{ this.zoom }}, {animate: true, duration: 1.5});
+                            
+                            var targetLat = {{ this.lat }};
+                            var targetLng = {{ this.lng }};
+                            var openPopup = null;
+
+                            // Find the currently open popup
+                            map.eachLayer(function(layer) {
+                                if (layer.getPopup && layer.getPopup() && layer.isPopupOpen()) {
+                                    openPopup = layer;
+                                }
+                            });
+
+                            if (openPopup) {
+                                // If a popup is open, we offset the reset center 
+                                // to move the map "up", ensuring the popup stays in view.
+                                // 2.5 degrees is roughly the offset needed at Zoom 6
+                                targetLat = openPopup.getLatLng().lat + 2.8; 
+                                targetLng = openPopup.getLatLng().lng;
+                            }
+
+                            map.flyTo([targetLat, targetLng], {{ this.zoom }}, {
+                                animate: true, 
+                                duration: 1.5
+                            });
                         });
                         return btn;
                     }
@@ -122,7 +181,7 @@ class FlyToOnClick(MacroElement):
         super().render(**kwargs)
 
 # -------- MAP GENERATION --------
-m = folium.Map(location=[13.7367, 100.5231], zoom_start=6)
+m = folium.Map(location=[13.7367, 100.5231], zoom_start=6, tiles="cartodbpositron")
 m.add_child(ResetViewControl(13.7367, 100.5231, 6))
 
 for idx, (_, row) in enumerate(filtered_df.iterrows()):
@@ -130,7 +189,6 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
     status = str(row.get('Status', 'Unknown'))
     status_bg = "#27ae60" if status.lower() == "active" else "#e74c3c" if status.lower() == "inactive" else "#95a5a6"
     
-    # Building the dynamic Detail Table for "View More"
     detail_rows = "".join([f"""
         <tr style="border-bottom: 1px solid #eee;">
             <td style="padding: 5px; font-weight: bold; color: #555; font-size: 11px;">{col}</td>
@@ -145,20 +203,17 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
           <div style="font-size:16px; font-weight:bold; margin-bottom:2px;">{row.get('Name','N/A')}</div>
           <div style="font-size:11px; opacity:0.8;">{row.get('Layer')} | {row.get('Sub-Category')}</div>
         </div>
-        
         <div style="padding:15px; border:1px solid #ddd; border-top:none; border-radius:0 0 8px 8px; background:white;">
           <div style="margin-bottom:8px;">
             <span style="font-size:11px; color:#888; text-transform:uppercase; font-weight:bold;">📍 Address & Geocode</span><br>
             <span style="font-size:12px;">{row.get('Address','N/A')}</span><br>
             <span style="font-size:10px; color:#3b82f6; font-weight:bold;">{row.get('Lat')}, {row.get('Long')}</span>
           </div>
-          
           <div style="margin-bottom:8px;">
             <span style="font-size:11px; color:#888; text-transform:uppercase; font-weight:bold;">📞 Contact Details</span><br>
             <span style="font-size:12px;"><b>Mgr:</b> {row.get('Owner / Manager','N/A')}</span><br>
             <span style="font-size:12px;"><b>Phone:</b> {row.get('Phone','N/A')} | <b>Email:</b> {row.get('Email','N/A')}</span>
           </div>
-
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
              <div>
                 <span style="font-size:11px; color:#888; text-transform:uppercase; font-weight:bold;">Status</span><br>
@@ -169,7 +224,6 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
                 <span style="font-size:11px;">{row.get('Source System')} ({row.get('Last Updated')})</span>
              </div>
           </div>
-
           <button onclick="
             document.getElementById('summary_{uid}').style.display='none';
             document.getElementById('detail_{uid}').style.display='block';
@@ -179,7 +233,6 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
           </button>
         </div>
       </div>
-
       <div id="detail_{uid}" style="display:none;">
         <div style="background:#2563eb; color:white; padding:10px; border-radius:8px 8px 0 0; display:flex; justify-content:space-between; align-items:center;">
           <span style="font-weight:bold; font-size:13px;">Full System Profile</span>
