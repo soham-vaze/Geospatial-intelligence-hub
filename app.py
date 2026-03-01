@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import folium
+import json
 from streamlit_folium import st_folium
 from branca.element import MacroElement
 from jinja2 import Template
@@ -52,10 +53,14 @@ st.markdown("""
     margin: 0 !important;
     max-width: 100% !important;
 }
-/* Make the Folium iframe fill the viewport */
+/* Make the Folium iframe fill the viewport but account for the header */
+[data-testid="stIFrame"] {
+    height: calc(100vh - 3rem) !important;
+    min-height: calc(100vh - 3rem) !important;
+}
 [data-testid="stIFrame"] > iframe {
-    height: 100vh !important;
-    min-height: 100vh !important;
+    height: 100% !important;
+    min-height: 100% !important;
 }
 /* Shrink the top header bar to reclaim space */
 [data-testid="stHeader"] {
@@ -292,9 +297,262 @@ class FlyToOnClick(MacroElement):
         self.map_name = list(figure._children.keys())[0] if figure else "map"
         super().render(**kwargs)
 
+# -------- PDF GENERATION MACRO --------
+class DownloadPDFMacro(MacroElement):
+    def __init__(self):
+        super().__init__()
+        self._template = Template("""
+            {% macro script(this, kwargs) %}
+            
+            // Helper to dynamically load JS libraries safely
+            window._loadScript = function(src) {
+                return new Promise((resolve, reject) => {
+                    if (document.querySelector(`script[src="${src}"]`)) {
+                        resolve(); return;
+                    }
+                    const script = document.createElement('script');
+                    script.src = src;
+                    script.onload = resolve;
+                    script.onerror = reject;
+                    document.head.appendChild(script);
+                });
+            };
+
+            window.generatePDF = async function(btn) {
+                const uid = btn.getAttribute('data-uid');
+                const rawData = btn.getAttribute('data-pdf-info');
+                const d = JSON.parse(rawData);
+                
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '⏳ Loading...';
+                btn.style.opacity = '0.7';
+                btn.style.pointerEvents = 'none';
+                
+                try {
+                    // 1. Ensure jsPDF is loaded
+                    await window._loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js");
+                    if (!window.jspdf || !window.jspdf.jsPDF) throw new Error("jsPDF failed");
+                    
+                    btn.innerHTML = '⏳ Map Tile...';
+                    
+                    const { jsPDF } = window.jspdf;
+                    const pdf = new jsPDF('p', 'mm', 'a4');
+                    
+                    // --- 1. Load Static High-Res Map (3x3 Tile Stitching) ---
+                    // The website uses CartoDB Dark Matter or Voyager, let's use Voyager (light, high contrast streets)
+                    const zoom = 15;
+                    const tileUrlBase = 'https://a.basemaps.cartocdn.com/rastertiles/voyager';
+                    
+                    const lon_rad = d.lng * Math.PI / 180;
+                    const lat_rad = d.lat * Math.PI / 180;
+                    const n = Math.pow(2, zoom);
+                    
+                    const exactX = (d.lng + 180) / 360 * n;
+                    const exactY = (1 - Math.log(Math.tan(lat_rad) + 1 / Math.cos(lat_rad)) / Math.PI) / 2 * n;
+                    
+                    const centerTileX = Math.floor(exactX);
+                    const centerTileY = Math.floor(exactY);
+                    
+                    // Center pixel of the marker within the center tile
+                    const markerPixelX = (exactX - centerTileX) * 256;
+                    const markerPixelY = (exactY - centerTileY) * 256;
+
+                    // We want a rectangular crop, e.g. 600px wide x 400px high, 
+                    // perfectly centered on the marker.
+                    const cropW = 600;
+                    const cropH = 400;
+                    
+                    const getCenteredMapBase64 = async () => {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = cropW;
+                        canvas.height = cropH;
+                        const ctx = canvas.getContext('2d');
+                        
+                        // Fill background just in case
+                        ctx.fillStyle = '#e5e7eb';
+                        ctx.fillRect(0, 0, cropW, cropH);
+                        
+                        // Load image helper
+                        const loadImg = (url) => new Promise((res, rej) => {
+                            const img = new Image();
+                            img.crossOrigin = 'anonymous';
+                            img.onload = () => res(img);
+                            img.onerror = () => res(null); // Ignore missing tiles gracefully
+                            img.src = url;
+                        });
+
+                        // Calculate offset to place marker exactly at center of canvas (300, 200)
+                        // If center tile (tx,ty) is drawn at (offsetX, offsetY), 
+                        // then marker is at (offsetX + markerPixelX, offsetY + markerPixelY).
+                        // We want: offsetX + markerPixelX = cropW/2
+                        const offsetX = (cropW / 2) - markerPixelX;
+                        const offsetY = (cropH / 2) - markerPixelY;
+
+                        // Fetch a 3x3 grid around the center tile to ensure we cover the 600x400 area
+                        const promises = [];
+                        for(let dy = -1; dy <= 1; dy++) {
+                            for(let dx = -1; dx <= 1; dx++) {
+                                const tx = centerTileX + dx;
+                                const ty = centerTileY + dy;
+                                const url = `${tileUrlBase}/${zoom}/${tx}/${ty}.png`;
+                                promises.push(loadImg(url).then(img => ({img, dx, dy})));
+                            }
+                        }
+                        
+                        const tiles = await Promise.all(promises);
+                        
+                        // Draw tiles
+                        tiles.forEach(t => {
+                            if(t.img) {
+                                const drawX = offsetX + (t.dx * 256);
+                                const drawY = offsetY + (t.dy * 256);
+                                ctx.drawImage(t.img, drawX, drawY);
+                            }
+                        });
+                        
+                        // Draw marker pin in exact center
+                        ctx.beginPath();
+                        ctx.arc(cropW/2, cropH/2, 10, 0, 2*Math.PI);
+                        ctx.fillStyle = '#ef4444'; // Red
+                        ctx.shadowColor = 'rgba(0,0,0,0.5)';
+                        ctx.shadowBlur = 4;
+                        ctx.shadowOffsetX = 0;
+                        ctx.shadowOffsetY = 2;
+                        ctx.fill();
+                        
+                        ctx.shadowColor = 'transparent';
+                        ctx.lineWidth = 3;
+                        ctx.strokeStyle = '#ffffff';
+                        ctx.stroke();
+                        
+                        return canvas.toDataURL('image/jpeg', 0.9);
+                    };
+
+                    let mapImg = null;
+                    try { mapImg = await getCenteredMapBase64(); } 
+                    catch(e) { console.warn("Map grid failed to load:", e); }
+
+                    // --- 2. HEADER BLOCK ---
+                    // Dark edge-to-edge header
+                    pdf.setFillColor(30, 41, 59); // #1e293b
+                    pdf.rect(0, 0, 210, 45, 'F');
+                    
+                    pdf.setTextColor(255, 255, 255);
+                    pdf.setFont("helvetica", "bold");
+                    pdf.setFontSize(22);
+                    let splitTitle = pdf.splitTextToSize(String(d.name), 180);
+                    pdf.text(splitTitle, 15, 20);
+                    
+                    pdf.setFontSize(11);
+                    pdf.setFont("helvetica", "normal");
+                    pdf.setTextColor(148, 163, 184); // #94a3b8
+                    pdf.text(`Geospatial Intelligence Report  •  ${d.layer}`, 15, 20 + (splitTitle.length * 8));
+                    
+                    // --- 3. MAP IMAGE (Right Side) ---
+                    let startY = 55;
+                    if (mapImg) {
+                        pdf.setDrawColor(203, 213, 225);
+                        pdf.setLineWidth(0.5);
+                        // Draw at (X:115, Y:50) size 84w x 56h mm (3:2 ratio matching 600x400 canvas)
+                        pdf.addImage(mapImg, 'JPEG', 111, 50, 84, 56);
+                        pdf.rect(111, 50, 84, 56); 
+                    }
+
+                    // --- 4. DATA SECTIONS (Left Side & Below) ---
+                    const drawSection = (title, yPos) => {
+                        pdf.setFont("helvetica", "bold");
+                        pdf.setFontSize(12);
+                        pdf.setTextColor(30, 41, 59);
+                        pdf.text(title, 15, yPos);
+                        pdf.setDrawColor(226, 232, 240);
+                        pdf.setLineWidth(0.5);
+                        pdf.line(15, yPos+2, 100, yPos+2); // Line up to map
+                        return yPos + 8;
+                    };
+                    const drawSectionFull = (title, yPos) => {
+                        pdf.setFont("helvetica", "bold");
+                        pdf.setFontSize(12);
+                        pdf.setTextColor(30, 41, 59);
+                        pdf.text(title, 15, yPos);
+                        pdf.setDrawColor(226, 232, 240);
+                        pdf.setLineWidth(0.5);
+                        pdf.line(15, yPos+2, 195, yPos+2); // Full width line
+                        return yPos + 8;
+                    };
+                    const drawItem = (label, val, xPos, yPos, maxW=45) => {
+                        pdf.setFont("helvetica", "bold");
+                        pdf.setFontSize(9);
+                        pdf.setTextColor(100, 116, 139);
+                        pdf.text(label, xPos, yPos);
+                        pdf.setFont("helvetica", "normal");
+                        pdf.setFontSize(10);
+                        pdf.setTextColor(15, 23, 42);
+                        let splitVal = pdf.splitTextToSize(String(val), maxW);
+                        pdf.text(splitVal, xPos + 28, yPos);
+                        return Math.max(7, splitVal.length * 5);
+                    };
+
+                    let curY = startY;
+                    
+                    // Box 1: Identity & Contact
+                    curY = drawSection("SITE IDENTITY & STATUS", curY);
+                    let h1 = drawItem("Address:", d.address, 15, curY, 65);
+                    curY += h1 + 1;
+                    h1 = drawItem("Coordinates:", `${d.lat.toFixed(5)}, ${d.lng.toFixed(5)}`, 15, curY, 65);
+                    curY += h1;
+                    h1 = drawItem("Status:", d.status, 15, curY, 65);
+                    curY += h1;
+                    h1 = drawItem("Manager:", d.manager, 15, curY, 65);
+                    curY += h1 + 8;
+
+                    // Push curY below the map image to expand to full width
+                    curY = Math.max(curY, 118);
+
+                    // Box 2: Classification
+                    curY = drawSectionFull("SITE CLASSIFICATION", curY);
+                    h1 = drawItem("Network Layer:", `${d.layer}`, 15, curY, 65);
+                    let h2 = drawItem("Category:", d.category, 115, curY, 65);
+                    curY += Math.max(h1, h2);
+                    h1 = drawItem("Sub-Category:", d.sub_category, 15, curY, 65);
+                    h2 = drawItem("Establishment:", d.estab_type, 115, curY, 65);
+                    curY += Math.max(h1, h2) + 6;
+
+                    // Box 3: Infrastructure & Service
+                    curY = drawSectionFull("INFRASTRUCTURE PROFILE", curY);
+                    h1 = drawItem("Service Bays:", d.bays, 15, curY, 65);
+                    h2 = drawItem("Specialization:", d.specialization, 115, curY, 70);
+                    curY += Math.max(h1, h2) + 6;
+                    
+                    // Box 4: Data Quality & Audit
+                    curY = drawSectionFull("SYSTEM AUDIT", curY);
+                    h1 = drawItem("Source System:", d.source_system, 15, curY, 65);
+                    h2 = drawItem("Last Updated:", d.last_updated, 115, curY, 70);
+                    curY += Math.max(h1, h2) + 10;
+                    
+                    // --- 5. FOOTER
+                    pdf.setFont("helvetica", "italic");
+                    pdf.setFontSize(8);
+                    pdf.setTextColor(148, 163, 184);
+                    const timestamp = new Date().toLocaleString();
+                    pdf.text(`Ford Geospatial Intelligence Hub - Confidential Report Generated: ${timestamp}`, 15, 285);
+                    
+                    pdf.save((d.name || 'Site').replace(/[^a-z0-9]/gi, '_') + '_Report.pdf');
+                } catch(e) {
+                    console.error("PDF generation failed", e);
+                    alert("Failed to generate PDF. Make sure plugins are loaded.");
+                } finally {
+                    btn.innerHTML = originalText;
+                    btn.style.opacity = '1';
+                    btn.style.pointerEvents = 'auto';
+                }
+            };
+            {% endmacro %}
+        """)
+
 # -------- MAP GENERATION --------
 m = folium.Map(location=[13.7367, 100.5231], zoom_start=6)
 m.add_child(ResetViewControl(13.7367, 100.5231, 6))
+m.add_child(DownloadPDFMacro())
 
 for idx, (_, row) in enumerate(filtered_df.iterrows()):
     uid = f"site_{idx}"
@@ -303,96 +561,49 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
     
 
     # -------- BUILD DETAIL PANEL SECTIONS --------
+    # --- Genuine detail extraction ---
     layer_label  = layer_meta.get(str(row.get('Layer','')), ('','',''))[2]
     bays         = int(row.get('Bays', 0))
-    bay_bar_pct  = min(int((bays / 20) * 100), 100)
-    source_sys   = row.get('Source System', row.get('SourceSystem', 'N/A'))
-    last_upd     = row.get('Last Updated', row.get('LastUpdated', 'N/A'))
-    category     = row.get('Category', 'N/A')
-    sub_cat      = row.get('Sub-Category', row.get('SubCategory', 'N/A'))
+    source_sys   = str(row.get('Source System', row.get('SourceSystem', 'N/A')))
+    raw_date     = row.get('Last Updated', row.get('LastUpdated', 'N/A'))
+    last_upd     = str(raw_date.date()) if hasattr(raw_date, 'date') else str(raw_date)
+    category     = str(row.get('Category', 'N/A'))
+    sub_cat      = str(row.get('Sub-Category', row.get('SubCategory', 'N/A')))
     site_name    = str(row.get('Name', ''))
+    phone        = str(row.get('Phone', 'N/A'))
+    email        = str(row.get('Email', 'N/A'))
+    spec         = str(row.get('Specialization', 'N/A'))
+    manager      = str(row.get('Owner / Manager', row.get('Owner', 'N/A')))
+    estab_type   = str(row.get('Establishment Type', 'N/A'))
+    address      = str(row.get('Address', 'N/A'))
 
-    # --- Deterministic derived insights (stable per site) ---
-    seed          = sum(ord(c) for c in site_name) + idx
-    rating        = (seed % 5) + 1                         # 1–5 stars
-    health_score  = 55 + (seed * 7 % 44)                   # 55–99%
-    monthly_vis   = 120 + (seed * 31 % 880)                # 120–999 monthly visitors
-    rev_tiers     = ["Emerging", "Growing", "Established", "High Value", "Strategic"]
-    rev_tier      = rev_tiers[seed % len(rev_tiers)]
-    coverage_km   = round(2.5 + (seed % 18) * 0.5, 1)     # 2.5–11.0 km
-    compliance    = 70 + (seed * 11 % 29)                  # 70–99%
-    stars_html    = "".join(
-        ["⭐" if i < rating else "☆" for i in range(5)]
-    )
-    health_color  = "#22c55e" if health_score >= 80 else "#f97316" if health_score >= 60 else "#ef4444"
-    comp_color    = "#22c55e" if compliance  >= 90 else "#f97316" if compliance  >= 75 else "#ef4444"
-
-    # --- Tier-matched review pools (reviews match the star rating) ---
-    reviews_low = [   # 1–2 stars: critical / disappointed
-        ("Arjun S.",  "Very disappointing experience. Long wait times and poor communication."),
-        ("Priya M.",  "Staff was unhelpful and the facility looked poorly maintained."),
-        ("Rahul K.",  "Wouldn't recommend. Service took twice the promised time."),
-        ("Neeraj D.", "Frequent billing errors and no follow-up from the team."),
-        ("Pooja T.",  "Extremely unresponsive to complaints. Will not return."),
-    ]
-    reviews_mid = [   # 3 stars: decent but room for improvement
-        ("Sneha T.",  "Decent service overall, but wait times can be long during peak hours."),
-        ("Vijay N.",  "Average experience. Facilities are adequate, nothing exceptional."),
-        ("Deepak L.", "OK visit. Staff was polite but the process felt disorganised."),
-        ("Meena R.",  "Service was acceptable. Would be better with online appointment booking."),
-        ("Suresh K.", "Gets the job done, but the customer lounge needs improvement."),
-    ]
-    reviews_high = [  # 4–5 stars: positive / glowing
-        ("Anita R.",  "Excellent technical expertise. Highly recommended – will visit again!"),
-        ("Kavya P.",  "Very responsive team. Resolved our query the same day. Outstanding!"),
-        ("Rohan M.",  "Clean, organized, and efficient. Best service center in the region."),
-        ("Divya S.",  "Impressed by the professionalism. The team went above and beyond."),
-        ("Amit B.",   "Fast turnaround and transparent pricing. Couldn't ask for more."),
-    ]
-
-    if rating <= 2:
-        pool = reviews_low
-    elif rating == 3:
-        pool = reviews_mid
-    else:
-        pool = reviews_high
-
-    r1 = pool[seed % len(pool)]
-    r2 = pool[(seed + 2) % len(pool)]
-
-
-    # --- Business Hours ---
-    hours_pool = [
-        ("Mon–Sat", "08:00 – 18:00"),
-        ("Mon–Sat", "09:00 – 19:00"),
-        ("Mon–Sun", "09:00 – 17:00"),
-        ("Mon–Fri", "08:30 – 17:30"),
-        ("Mon–Sun", "08:00 – 20:00"),
-    ]
-    biz_days, biz_time = hours_pool[seed % len(hours_pool)]
-    lunch_break = "13:00–14:00" if seed % 3 == 0 else "None"
-
-    # --- Vehicle Specialization ---
-    spec_all = ["Passenger Cars", "SUVs & MUVs", "Commercial Vehicles",
-                "Electric Vehicles", "Trucks", "Fleet Maintenance"]
-    n_specs = 2 + (seed % 3)
-    specializations = [spec_all[(seed + i * 2) % len(spec_all)] for i in range(n_specs)]
-
-    # --- Infrastructure ---
-    parking_spots  = 10 + (seed % 60)
-    ev_bays        = seed % 6
-    showroom_sqft  = 800 + (seed * 7 % 4200)
-    has_lounge     = seed % 4 != 0
-    has_test_drive = seed % 3 == 0
-
-    # --- Market Intelligence ---
-    competitors    = seed % 8
-    mkt_share_pct  = 15 + (seed * 3 % 55)
-    mkt_color      = "#22c55e" if mkt_share_pct >= 45 else "#f97316" if mkt_share_pct >= 25 else "#ef4444"
-    opp_score      = 40 + (seed * 13 % 59)
-    opp_color      = "#22c55e" if opp_score >= 75 else "#f97316" if opp_score >= 55 else "#3b82f6"
-    trends         = ["Growing demand", "Stable market", "High competition", "Untapped potential", "Seasonal peaks"]
-    trend_tag      = trends[seed % len(trends)]
+    import math
+    safe_lat = row.get('Lat', 0.0)
+    safe_lng = row.get('Long', 0.0)
+    if math.isnan(safe_lat): safe_lat = 0.0
+    if math.isnan(safe_lng): safe_lng = 0.0
+    
+    pdf_data = {
+        "uid": uid,
+        "lat": safe_lat,
+        "lng": safe_lng,
+        "name": site_name,
+        "address": address,
+        "layer": layer_label,
+        "category": category,
+        "sub_category": sub_cat,
+        "status": status.upper(),
+        "manager": manager,
+        "phone": phone,
+        "email": email,
+        "bays": bays,
+        "specialization": spec,
+        "estab_type": estab_type,
+        "source_system": source_sys,
+        "last_updated": last_upd
+    }
+    # Safely escape double quotes for the HTML attribute
+    pdf_json_str = json.dumps(pdf_data).replace('"', '&quot;')
 
     popup_html = f"""
     <div style="width:340px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
@@ -442,46 +653,35 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
             <div style="font-weight:700; font-size:13px; letter-spacing:0.3px;">📋 Full System Profile</div>
             <div style="font-size:10px; opacity:0.7; margin-top:1px;">{row.get('Name','N/A')}</div>
           </div>
-          <button onclick="
-            document.getElementById('detail_{uid}').style.display='none';
-            document.getElementById('summary_{uid}').style.display='block';
-            this.closest('.leaflet-popup-content-wrapper').parentElement._popup.update();
-          " style="background:rgba(255,255,255,0.15); border:1px solid rgba(255,255,255,0.4); color:white; padding:3px 10px; border-radius:4px; cursor:pointer; font-size:10px; font-weight:600;">&larr; BACK</button>
+          <div style="display:flex; gap:6px;">
+            <button id="pdfBtn_{uid}" data-uid="{uid}" data-pdf-info="{pdf_json_str}" onclick="window.generatePDF(this)" style="background:#1e3a8a; border:1px solid rgba(255,255,255,0.2); color:#ffffff; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:10px; font-weight:700; display:flex; align-items:center; box-shadow:0 1px 2px rgba(0,0,0,0.1); transition:all 0.2s;">
+              📥 Report
+            </button>
+            <button onclick="
+              document.getElementById('detail_{uid}').style.display='none';
+              document.getElementById('summary_{uid}').style.display='block';
+              this.closest('.leaflet-popup-content-wrapper').parentElement._popup.update();
+            " style="background:rgba(255,255,255,0.15); border:1px solid rgba(255,255,255,0.4); color:white; padding:3px 10px; border-radius:4px; cursor:pointer; font-size:10px; font-weight:600;">&larr; BACK</button>
+          </div>
         </div>
 
         <!-- Scrollable body -->
         <div style="border:1px solid #ddd; border-top:none; border-radius:0 0 8px 8px; background:#f8fafc; max-height:300px; overflow-y:auto; padding:10px 12px;">
-
-          <!-- QUICK METRICS STRIP -->
-          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-bottom:12px;">
-            <div style="background:white; border:1px solid #e2e8f0; border-radius:6px; padding:7px 8px; text-align:center;">
-              <div style="font-size:14px; font-weight:800; color:#2563eb;">{monthly_vis}</div>
-              <div style="font-size:9px; color:#94a3b8; font-weight:600; text-transform:uppercase; margin-top:1px;">Monthly Visitors</div>
-            </div>
-            <div style="background:white; border:1px solid #e2e8f0; border-radius:6px; padding:7px 8px; text-align:center;">
-              <div style="font-size:14px; font-weight:800; color:#7c3aed;">{coverage_km} km</div>
-              <div style="font-size:9px; color:#94a3b8; font-weight:600; text-transform:uppercase; margin-top:1px;">Coverage Radius</div>
-            </div>
-            <div style="background:white; border:1px solid #e2e8f0; border-radius:6px; padding:7px 8px; text-align:center;">
-              <div style="font-size:11px; font-weight:800; color:#0891b2; line-height:1.2; padding-top:2px;">{rev_tier}</div>
-              <div style="font-size:9px; color:#94a3b8; font-weight:600; text-transform:uppercase; margin-top:1px;">Revenue Tier</div>
-            </div>
-          </div>
 
           <!-- IDENTITY -->
           <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">📌 Identity</div>
           <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px; margin-bottom:10px;">
             <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
               <span style="color:#94a3b8; font-size:10px; font-weight:600;">SITE NAME</span>
-              <span style="font-size:11px; font-weight:700; color:#1e293b; max-width:180px; text-align:right;">{row.get('Name','N/A')}</span>
+              <span style="font-size:11px; font-weight:700; color:#1e293b; max-width:180px; text-align:right;">{site_name}</span>
             </div>
             <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
               <span style="color:#94a3b8; font-size:10px; font-weight:600;">ADDRESS</span>
-              <span style="font-size:10px; color:#374151; max-width:190px; text-align:right; line-height:1.3;">{row.get('Address','N/A')}</span>
+              <span style="font-size:10px; color:#374151; max-width:190px; text-align:right; line-height:1.3;">{address}</span>
             </div>
             <div style="display:flex; justify-content:space-between;">
               <span style="color:#94a3b8; font-size:10px; font-weight:600;">COORDINATES</span>
-              <span style="font-size:10px; color:#3b82f6; font-weight:700;">{round(float(row.get('Lat',0)),5)}, {round(float(row.get('Long',0)),5)}</span>
+              <span style="font-size:10px; color:#3b82f6; font-weight:700;">{round(safe_lat,5)}, {round(safe_lng,5)}</span>
             </div>
           </div>
 
@@ -489,88 +689,37 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
           <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">🏷️ Classification</div>
           <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px; margin-bottom:10px;">
             <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:6px;">
-              <span style="background:#dbeafe; color:#1d4ed8; font-size:10px; font-weight:700; padding:2px 8px; border-radius:20px;">{row.get('Layer','N/A')}</span>
+              <span style="background:#dbeafe; color:#1d4ed8; font-size:10px; font-weight:700; padding:2px 8px; border-radius:20px;">{row.get('Layer','N/A')} ({layer_label})</span>
               <span style="background:#f3e8ff; color:#7e22ce; font-size:10px; font-weight:600; padding:2px 8px; border-radius:20px;">{category}</span>
               <span style="background:#ecfdf5; color:#166534; font-size:10px; font-weight:600; padding:2px 8px; border-radius:20px;">{sub_cat}</span>
+              <span style="background:#fef3c7; color:#92400e; font-size:10px; font-weight:600; padding:2px 8px; border-radius:20px;">{estab_type}</span>
             </div>
-            <div style="font-size:10px; color:#64748b; padding-top:4px; border-top:1px solid #f1f5f9;">{layer_label}</div>
           </div>
 
           <!-- CONTACT & OPERATIONS -->
-          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">👤 Contact &amp; Operations</div>
+          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">👤 Contact &amp; Infrastructure</div>
           <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px; margin-bottom:10px;">
             <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
               <span style="color:#94a3b8; font-size:10px; font-weight:600;">MANAGER</span>
-              <span style="font-size:10px; color:#1e293b; font-weight:600;">{row.get('Owner / Manager', row.get('Owner','N/A'))}</span>
+              <span style="font-size:10px; color:#1e293b; font-weight:600;">{manager}</span>
             </div>
             <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
               <span style="color:#94a3b8; font-size:10px; font-weight:600;">PHONE</span>
-              <span style="font-size:10px; color:#1e293b;">{row.get('Phone','N/A')}</span>
+              <span style="font-size:10px; color:#1e293b;">{phone}</span>
             </div>
             <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
               <span style="color:#94a3b8; font-size:10px; font-weight:600;">EMAIL</span>
-              <span style="font-size:10px; color:#3b82f6;">{row.get('Email','N/A')}</span>
+              <span style="font-size:10px; color:#3b82f6;">{email}</span>
             </div>
             <div style="border-top:1px solid #f1f5f9; padding-top:8px;">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
                 <span style="color:#94a3b8; font-size:10px; font-weight:600;">SERVICE BAYS</span>
                 <span style="font-size:11px; font-weight:800; color:#1e293b;">{bays}</span>
               </div>
-              <div style="background:#e2e8f0; border-radius:4px; height:5px;">
-                <div style="background:linear-gradient(90deg,#3b82f6,#2563eb); width:{bay_bar_pct}%; height:5px; border-radius:4px;"></div>
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="color:#94a3b8; font-size:10px; font-weight:600;">SPECIALIZATION</span>
+                <span style="font-size:10px; font-weight:600; color:#1e293b;">{spec}</span>
               </div>
-            </div>
-          </div>
-
-          <!-- PERFORMANCE & INSIGHTS -->
-          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">📊 Performance &amp; Insights</div>
-          <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px; margin-bottom:10px;">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-              <span style="color:#94a3b8; font-size:10px; font-weight:600;">SITE RATING</span>
-              <span style="font-size:13px; letter-spacing:1px;">{stars_html}</span>
-            </div>
-            <div style="margin-bottom:6px;">
-              <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
-                <span style="color:#94a3b8; font-size:10px; font-weight:600;">SITE HEALTH</span>
-                <span style="font-size:10px; font-weight:700; color:{health_color};">{health_score}%</span>
-              </div>
-              <div style="background:#e2e8f0; border-radius:4px; height:5px;">
-                <div style="background:{health_color}; width:{health_score}%; height:5px; border-radius:4px; transition:width 0.5s;"></div>
-              </div>
-            </div>
-            <div>
-              <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
-                <span style="color:#94a3b8; font-size:10px; font-weight:600;">COMPLIANCE SCORE</span>
-                <span style="font-size:10px; font-weight:700; color:{comp_color};">{compliance}%</span>
-              </div>
-              <div style="background:#e2e8f0; border-radius:4px; height:5px;">
-                <div style="background:{comp_color}; width:{compliance}%; height:5px; border-radius:4px;"></div>
-              </div>
-            </div>
-          </div>
-
-          <!-- CUSTOMER REVIEWS -->
-          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">💬 Customer Reviews</div>
-          <div style="margin-bottom:10px;">
-            <div style="background:white; border:1px solid #e2e8f0; border-radius:6px; padding:9px 10px; margin-bottom:6px;">
-              <div style="display:flex; align-items:center; gap:8px; margin-bottom:5px;">
-                <div style="width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#3b82f6,#8b5cf6); color:white; font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0;">{r1[0][0]}</div>
-                <div>
-                  <div style="font-size:11px; font-weight:700; color:#1e293b;">{r1[0]}</div>
-                  <div style="font-size:11px; color:#f59e0b; letter-spacing:1px;">{'⭐' * rating}{'☆' * (5-rating)}</div>
-                </div>
-              </div>
-              <div style="font-size:10px; color:#475569; font-style:italic; line-height:1.4;">&ldquo;{r1[1]}&rdquo;</div>
-            </div>
-            <div style="background:white; border:1px solid #e2e8f0; border-radius:6px; padding:9px 10px;">
-              <div style="display:flex; align-items:center; gap:8px; margin-bottom:5px;">
-                <div style="width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#22c55e,#0891b2); color:white; font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0;">{r2[0][0]}</div>
-                <div>
-                  <div style="font-size:11px; font-weight:700; color:#1e293b;">{r2[0]}</div>
-                  <div style="font-size:11px; color:#f59e0b; letter-spacing:1px;">{'⭐' * max(rating-1,1)}{'☆' * (5-max(rating-1,1))}</div>
-                </div>
-              </div>
-              <div style="font-size:10px; color:#475569; font-style:italic; line-height:1.4;">&ldquo;{r2[1]}&rdquo;</div>
             </div>
           </div>
 
@@ -588,91 +737,6 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
             <div style="display:flex; justify-content:space-between;">
               <span style="color:#94a3b8; font-size:10px; font-weight:600;">LAST UPDATED</span>
               <span style="font-size:10px; color:#1e293b;">{last_upd}</span>
-            </div>
-          </div>
-
-          <!-- BUSINESS HOURS & FACILITIES -->
-          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">🕐 Business Hours &amp; Facilities</div>
-          <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px; margin-bottom:10px;">
-            <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-              <span style="color:#94a3b8; font-size:10px; font-weight:600;">OPERATING DAYS</span>
-              <span style="font-size:10px; font-weight:700; color:#1e293b;">{biz_days}</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-              <span style="color:#94a3b8; font-size:10px; font-weight:600;">HOURS</span>
-              <span style="font-size:10px; font-weight:700; color:#2563eb;">{biz_time}</span>
-            </div>
-            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-              <span style="color:#94a3b8; font-size:10px; font-weight:600;">LUNCH BREAK</span>
-              <span style="font-size:10px; color:#64748b;">{lunch_break}</span>
-            </div>
-            <div style="border-top:1px solid #f1f5f9; padding-top:7px; display:flex; gap:6px; flex-wrap:wrap;">
-              <span style="background:{'#dcfce7' if has_lounge else '#fee2e2'}; color:{'#166534' if has_lounge else '#991b1b'}; font-size:9px; font-weight:700; padding:2px 7px; border-radius:20px;">{'✓ Customer Lounge' if has_lounge else '✗ No Lounge'}</span>
-              <span style="background:{'#dbeafe' if has_test_drive else '#f1f5f9'}; color:{'#1d4ed8' if has_test_drive else '#64748b'}; font-size:9px; font-weight:700; padding:2px 7px; border-radius:20px;">{'🚗 Test Drive' if has_test_drive else 'No Test Drive'}</span>
-            </div>
-          </div>
-
-          <!-- VEHICLE SPECIALIZATION -->
-          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">🚘 Vehicle Specialization</div>
-          <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px; margin-bottom:10px;">
-            <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:8px;">
-              {''.join(f'<span style="background:#eff6ff; color:#1d4ed8; font-size:9px; font-weight:700; padding:2px 8px; border-radius:20px; border:1px solid #bfdbfe;">{s}</span>' for s in specializations)}
-            </div>
-            <div style="border-top:1px solid #f1f5f9; padding-top:7px;">
-              <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-                <span style="color:#94a3b8; font-size:10px; font-weight:600;">SHOWROOM AREA</span>
-                <span style="font-size:10px; font-weight:700; color:#1e293b;">{showroom_sqft:,} sq ft</span>
-              </div>
-              <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-                <span style="color:#94a3b8; font-size:10px; font-weight:600;">PARKING SPOTS</span>
-                <span style="font-size:10px; font-weight:700; color:#1e293b;">{parking_spots}</span>
-              </div>
-              <div style="display:flex; justify-content:space-between;">
-                <span style="color:#94a3b8; font-size:10px; font-weight:600;">EV CHARGING BAYS</span>
-                <span style="font-size:10px; font-weight:700; color:{'#22c55e' if ev_bays > 0 else '#94a3b8'};">{ev_bays if ev_bays > 0 else 'None'}</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- MARKET INTELLIGENCE -->
-          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">📈 Market Intelligence</div>
-          <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px; margin-bottom:10px;">
-            <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-              <span style="color:#94a3b8; font-size:10px; font-weight:600;">NEARBY COMPETITORS</span>
-              <span style="font-size:10px; font-weight:700; color:#1e293b;">{competitors} sites</span>
-            </div>
-            <div style="margin-bottom:6px;">
-              <div style="display:flex; justify-content:space-between; margin-bottom:3px;">
-                <span style="color:#94a3b8; font-size:10px; font-weight:600;">EST. MARKET SHARE</span>
-                <span style="font-size:10px; font-weight:700; color:{mkt_color};">{mkt_share_pct}%</span>
-              </div>
-              <div style="background:#e2e8f0; border-radius:4px; height:5px;">
-                <div style="background:{mkt_color}; width:{mkt_share_pct}%; height:5px; border-radius:4px;"></div>
-              </div>
-            </div>
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-              <span style="color:#94a3b8; font-size:10px; font-weight:600;">MARKET TREND</span>
-              <span style="background:#f1f5f9; color:#334155; font-size:9px; font-weight:700; padding:2px 8px; border-radius:20px;">{trend_tag}</span>
-            </div>
-          </div>
-
-          <!-- OPPORTUNITY SCORE -->
-          <div style="font-size:9px; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px;">🎯 Opportunity Score</div>
-          <div style="background:white; border-radius:6px; border:1px solid #e2e8f0; padding:10px;">
-            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
-              <div>
-                <div style="font-size:22px; font-weight:900; color:{opp_color}; line-height:1;">{opp_score}<span style="font-size:12px; font-weight:600; color:#94a3b8;">/100</span></div>
-                <div style="font-size:9px; color:#94a3b8; font-weight:600; margin-top:2px;">EXPANSION POTENTIAL</div>
-              </div>
-              <div style="text-align:right;">
-                <div style="font-size:11px; font-weight:700; color:{opp_color};">
-                  {'🔥 High Priority' if opp_score >= 75 else '⚡ Medium Priority' if opp_score >= 55 else '🔵 Monitor'}
-                </div>
-                <div style="font-size:9px; color:#94a3b8; margin-top:2px;">Rev Tier: {rev_tier}</div>
-              </div>
-            </div>
-            <div style="background:#e2e8f0; border-radius:6px; height:8px;">
-              <div style="background:linear-gradient(90deg,{opp_color},{opp_color}aa); width:{opp_score}%; height:8px; border-radius:6px;"></div>
             </div>
           </div>
 
@@ -694,4 +758,4 @@ for idx, (_, row) in enumerate(filtered_df.iterrows()):
     marker.add_child(fly)
 
 # -------- RENDER --------
-st_folium(m, width="100%", height=900, key=f"map_{st.session_state.map_key}")
+st_folium(m, width="100%", height=700, use_container_width=True, key=f"map_{st.session_state.map_key}")

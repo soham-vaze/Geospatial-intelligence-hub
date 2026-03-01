@@ -41,3 +41,5 @@ tzdata==2025.3
 urllib3==2.6.3
 watchdog==6.0.0
 xyzservices==2025.11.0
+fpdf2==2.8.4
+defusedxml==0.7.1
